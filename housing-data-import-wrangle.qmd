@@ -1,0 +1,472 @@
+---
+title: "Untitled"
+format: html
+---
+
+# Full ML Demo
+
+### Snowpark ML
+
+Next let's explore snowpark ML, our machine learning algorithms that can be deployed natively in Snowflake. 
+
+### Load Libraries
+
+```{python}
+import pandas as pd
+import os
+import datetime as dt
+import json
+import numpy as np
+
+# Snowpark
+import snowflake.snowpark as snp
+from snowflake.snowpark.functions import udf, col, lag, lit, trunc, to_date
+from snowflake.snowpark.session import Session
+from snowflake.snowpark.types import *
+from snowflake.snowpark.version import VERSION
+import snowflake.connector
+
+# Snow ML
+from snowflake.ml.modeling.pipeline import pipeline
+
+# Snowpark ML preprocessing
+import snowflake.ml.modeling.preprocessing as snowmlpp
+from snowflake.ml.modeling.impute import SimpleImputer
+
+# Snowpark ML metrics
+from snowflake.ml.modeling.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+from snowflake.ml.modeling.metrics.correlation import correlation
+
+# Snowpark ML Models
+from snowflake.ml.modeling.xgboost import XGBRegressor
+from snowflake.ml.modeling.linear_model import LinearRegression, LogisticRegression, Lasso, Ridge
+from snowflake.ml.modeling.ensemble import RandomForestRegressor
+
+# Snowpark ML Feature Store
+from snowflake.ml.feature_store.feature_store import FeatureStore, CreationMode, FeatureView, Entity
+
+# Snowpark ML model registry
+from snowflake.ml.registry import model_registry
+from snowflake.ml.modeling.model_selection import GridSearchCV
+```
+
+
+
+### Enter Creds, Connect to Snowflake and Create Session
+
+```{python}
+
+# Read credentials
+with open('creds.json') as f:
+    connection_parameters = json.load(f)
+# Connect to a snowflake session
+session = Session.builder.configs(connection_parameters).create()
+```
+
+### Confirm DB, Schema and WH
+
+```{python}
+
+# check or confirm current session settings? 
+session.get_current_database()
+session.get_current_schema()
+session.get_current_warehouse()
+
+# What version of snowpark are we running?
+snowpark_version = VERSION
+
+print('Snowpark for Python version : {}.{}.{}'.format(snowpark_version[0],snowpark_version[1],snowpark_version[2]))
+```
+
+
+### House Price data
+
+Let's import some data from our database. This is a secure view that we created from snowsight, based on marketplace data.
+
+```{python}
+
+msa_county = (
+    session.table("COUNTY_FIP_MSA")
+)
+
+msa_county.show(5)
+# housing data frame
+housing_prices = (
+    session.table("HOUSING_PRICES_VIEW") 
+    .select("SOLD_DATE", "SOLD_PRICE", "ZIP_CODE", "SQUARE_FEET", "BED_COUNT", "BATH_COUNT", "PROPERTY_TYPE", "RENT_ZESTIMATE", "MLS_NUMBER", "YEAR_BUILT", "COUNTY_FIPS")
+    .filter((col('BED_COUNT') > 0))
+    .filter((col('BED_COUNT') < 6))
+    .filter((col('BATH_COUNT') > 0))
+    .filter((col('BATH_COUNT') <= 4))
+    .filter((col('SOLD_PRICE') >1000))
+
+)
+
+# Join the data
+housing_msa_prices = (
+            housing_prices
+            .join(msa_county, housing_prices.col("COUNTY_FIPS") == msa_county.col("COUNTY_FIPS"))
+            .select("MSA_NAME", "SOLD_DATE", "SOLD_PRICE", "ZIP_CODE", "SQUARE_FEET", "BED_COUNT", "BATH_COUNT", "PROPERTY_TYPE", "RENT_ZESTIMATE", "MLS_NUMBER", "YEAR_BUILT")
+        )
+
+housing_msa_prices.show(5)
+```
+
+### Feature Engineering and Preprocessing
+
+Let's take a tour of some Snowflake native algorithms. These are part of snowpark ML but run as part of the data frame API, meaning as sql.
+
+We'll start by imputing some missing values.
+
+```{python}
+snowml_simpleimputer = SimpleImputer(input_cols=['SQUARE_FEET', 'YEAR_BUILT', 'SOLD_PRICE'], output_cols=['SQUARE_FEET', 'YEAR_BUILT', 'SOLD_PRICE'], strategy='most_frequent')
+
+housing_msa_prices_imputed = snowml_simpleimputer.fit(housing_msa_prices).transform(housing_msa_prices)
+
+housing_msa_prices_imputed.describe().show()
+
+```
+
+
+Next we'll convert a feature to ordinal encodings. Beds and baths are numbers but my opinion is we think of these are more categorical.
+
+```{python}
+# Encode beds and baths preserve ordinal importance
+categories = {
+    "BED_COUNT": np.array(["1", "2", "3", "4", "5"]),
+    "BATH_COUNT": np.array(["1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0"]),
+}
+
+snowml_oe = snowmlpp.OrdinalEncoder(input_cols=["BED_COUNT", "BATH_COUNT"], output_cols=["BED_OE", "BATH_OE"], categories=categories)
+
+ord_encoded_housing_prices = snowml_oe.fit(housing_msa_prices_imputed).transform(housing_msa_prices_imputed)
+
+
+# Show the encoding
+print(snowml_oe._state_pandas)
+
+```
+### One Hot Encoding
+
+Next we'll one hot encode property type into dummy variables. 
+
+```{python}
+# Encode categoricals to numeric columns
+snowml_ohe = snowmlpp.OneHotEncoder(input_cols=["PROPERTY_TYPE"], output_cols=["PROPERTY_TYPE_OHE"])
+
+transformed_ord_encoded_housing_prices = snowml_ohe.fit(ord_encoded_housing_prices).transform(ord_encoded_housing_prices)
+
+np.array(transformed_ord_encoded_housing_prices.columns)
+
+transformed_ord_encoded_housing_prices.show()
+
+transformed_ord_encoded_housing_prices.columns
+```
+
+### K Bins
+
+Square feet is another numeric feature that I prefer to change, though it's not strictly necessary. Let's put this into discrete bins and then encode them as ordinals. 
+
+```{python}
+# Encode categoricals to numeric columns
+snowml_kbins = snowmlpp.KBinsDiscretizer(input_cols=["SQUARE_FEET"], output_cols=["SQUARE_FEET_BINNED"], encode = 'ordinal', n_bins = 10)
+
+kbins_transformed_ord_encoded_housing_prices = snowml_kbins.fit(transformed_ord_encoded_housing_prices).transform(transformed_ord_encoded_housing_prices)
+
+np.array(kbins_transformed_ord_encoded_housing_prices.columns)
+
+kbins_transformed_ord_encoded_housing_prices.show()
+
+```
+
+### Split Train, Test
+
+If we feel good about these features, we can start to fit models from here. 
+
+```{python}
+# Split the data into train and test sets
+train_df, test_df = kbins_transformed_ord_encoded_housing_prices.random_split(weights=[0.8, 0.2], seed=42)
+
+```
+
+
+```{python}
+# Categorize all the features for modeling
+CATEGORICAL_COLUMNS_OE = ["BED_OE", "BATH_OE"] # To name the ordinal encoded columns
+OHE_COLUMNS = snowml_ohe.fit(ord_encoded_housing_prices).get_output_cols()
+NUMERIC_COLUMNS = ["RENT_ZESTIMATE"]
+BINNED_COLUMNS = ['SQUARE_FEET_BINNED']
+
+LABEL_COLUMNS = ['SOLD_PRICE']
+OUTPUT_COLUMNS = ['PREDICTED_PRICE']
+```
+
+### Snowpark ML XGBoost
+
+```{python} 
+# Define the XGBRegressor
+regressor = XGBRegressor(
+    input_cols=OHE_COLUMNS+CATEGORICAL_COLUMNS_OE+BINNED_COLUMNS+NUMERIC_COLUMNS,
+    label_cols=LABEL_COLUMNS,
+    output_cols=OUTPUT_COLUMNS
+)
+```
+
+```{python}
+# Train
+regressor.fit(train_df)
+```
+
+```{python}
+# Predict
+result = regressor.predict(test_df)
+```
+
+Let's see how we did with a look at the mean absolute percentage error.
+
+```{python}
+mape = mean_absolute_percentage_error(df=result, 
+                                        y_true_col_names="SOLD_PRICE", 
+                                        y_pred_col_names="PREDICTED_PRICE")
+
+result.select("SOLD_PRICE", "PREDICTED_PRICE").show()
+print(f"Mean absolute percentage error: {mape}")
+```
+
+### Tune
+
+Let's use grid search to search for optimal hyperparamters. Soon to be released is a version of grid search that parallelized under the hood.
+
+```{python}
+grid_search = GridSearchCV(
+    estimator=XGBRegressor(),
+    param_grid={
+        "n_estimators":[100, 200, 300, 400, 500],
+        "learning_rate":[0.1, 0.2, 0.3, 0.4, 0.5],
+    },
+    n_jobs = -1,
+    scoring="neg_mean_absolute_percentage_error",
+    input_cols=BINNED_COLUMNS+OHE_COLUMNS+CATEGORICAL_COLUMNS_OE,
+    label_cols=LABEL_COLUMNS,
+    output_cols=OUTPUT_COLUMNS
+)
+
+# Train
+grid_search.fit(train_df)
+```
+
+
+```{python}
+# Predict
+grid_search_result = grid_search.predict(test_df)
+
+# Analyze results
+mape = mean_absolute_percentage_error(df=grid_search_result, 
+                                        y_true_col_names="SOLD_PRICE", 
+                                        y_pred_col_names="PREDICTED_PRICE")
+
+result.select("SOLD_PRICE", "PREDICTED_PRICE").show()
+print(f"Mean absolute percentage error: {mape}")
+```
+
+
+```{python}
+# Analyze grid search results
+gs_results = grid_search.to_sklearn().cv_results_
+n_estimators_val = []
+learning_rate_val = []
+
+for param_dict in gs_results["params"]:
+    n_estimators_val.append(param_dict["n_estimators"])
+    learning_rate_val.append(param_dict["learning_rate"])
+
+mape_val = gs_results["mean_test_score"]*-1
+
+gs_results_df = pd.DataFrame(data={
+    "n_estimators":n_estimators_val,
+    "learning_rate":learning_rate_val,
+    "mape":mape_val})
+```
+
+```{python}
+# Let's save our optimal model first and its metadata
+optimal_model = grid_search.to_sklearn().best_estimator_
+
+optimal_n_estimators = grid_search.to_sklearn().best_estimator_.n_estimators
+
+optimal_learning_rate = grid_search.to_sklearn().best_estimator_.learning_rate
+
+optimal_mape = gs_results_df.loc[(gs_results_df['n_estimators']==optimal_n_estimators) &
+                                 (gs_results_df['learning_rate']==optimal_learning_rate), 'mape'].values[0]
+
+
+```
+
+### Feature Store
+
+Let's review the steps for memorializing our chosen features. 
+
+```{python}
+fs = FeatureStore(
+session = session,
+database = "BANK_STOCKS_DB",
+name = 'BANKS_STOCKS_SCHEMA',
+default_warehouse = "BANK_STOCK_WH",
+creation_mode = CreationMode.CREATE_IF_NOT_EXIST,
+)
+```
+
+```{python}
+entity = Entity(name="HOUSING_FEATURES_2", join_keys=["MLS_NUMBER"])
+
+fs.register_entity(entity)
+
+fs.list_entities().show()
+```
+
+```{python}
+housing_features_view_2 = FeatureView(
+name = "HOUSING_FEATURES_VIEW_2",
+entities = [entity],
+feature_df = kbins_transformed_ord_encoded_housing_prices,
+desc = "features for modeling housing prices"
+)
+
+housing_features_view_registered = fs.register_feature_view(
+feature_view = housing_features_view_2,
+version = "V3",
+block = True,
+refresh_freq="1 minute", # if this is missing, it's a view; if included, it's a dyn table; could set this to say 1 day
+)
+```
+
+### Use Feature Store
+
+```{python}
+original_housing_df = session.table(f"BANK_STOCKS_DB.BANKS_STOCKS_SCHEMA.HOUSING_PRICES_VIEW")
+
+original_housing_df = original_housing_df.select("MLS_NUMBER")
+
+
+original_housing_df.show(5)
+```
+
+Now we can take our original data set and use our feature store to generate training data. Our colleagues could use this same process to reproduce or expand upon our work.
+
+```{python}
+
+training_data = fs.generate_dataset(
+    spine_df=original_housing_df, 
+    features=[housing_features_view_registered], 
+    materialized_table="HOUSING_TRAINING_DATA_TABLE",  
+    spine_label_cols=["SOLD_PRICE"],
+    save_mode="merge",
+    exclude_columns=['MLS_NUMBER']
+)
+```
+
+### Use Feature Store in a model
+
+From here, we can take that training data and revisit our modeling workflow.
+
+
+```{python}
+training_data.df.to_pandas()
+
+train_df, test_df = training_data.df.random_split([0.8, 0.2], seed=42)
+
+train_df = train_df.dropna()
+test_df.show(5)
+```
+
+```{python}
+# Define the XGBRegressor
+xgb_model = XGBRegressor(
+    input_cols=OHE_COLUMNS+CATEGORICAL_COLUMNS_OE+BINNED_COLUMNS+NUMERIC_COLUMNS,
+    label_cols=LABEL_COLUMNS,
+    output_cols="PREDICTED_PRICE"
+)
+```
+
+```{python}
+# Train
+xgb_model.fit(train_df)
+```
+
+```{python}
+# Predict
+result = xgb_model.predict(test_df)
+```
+
+
+```{python}
+mape = mean_absolute_percentage_error(df=result, 
+                                        y_true_col_names="SOLD_PRICE", 
+                                        y_pred_col_names="PREDICTED_PRICE")
+
+result.select("SOLD_PRICE", "PREDICTED_PRICE").show()
+print(f"Mean absolute percentage error: {mape}")
+```
+
+### Model Registry
+
+Once we're happy with this model and features, we can save the model and feature artifacts to the model registry. 
+
+First we create a registery.
+```{python}
+from snowflake.ml.registry import model_registry
+import time
+
+# Model registry database name.
+MR_DEMO_DB = f"HOUSING_MODEL_REGISTRY_DEMO_DB"
+
+registry = model_registry.ModelRegistry(
+    session=session, 
+    database_name=MR_DEMO_DB, 
+    create_if_not_exists=True
+)
+```
+
+Next we log our training data set, that was generated from our feature store, as a model artifact.
+
+```{python}
+housing_featured_dataset = registry.log_artifact(
+    artifact=training_data,
+    name="HOUSING_FEATURES_DATASET",
+    version="V1",
+)
+```
+
+Next we save the model itself.
+
+```{python}
+model_name = f"MY_XGB_REGRESSOR_{time.time()}"
+
+model_ref = registry.log_model(
+    model_name=model_name,
+    model_version="V1",
+    model=xgb_model, # or our optimal_model
+    tags={"author": "my_xgb_with_training_data"},
+    artifacts=[housing_featured_dataset],
+    options={"embed_local_ml_library": True},
+)
+```
+
+Once registered this model can be called like any other UDF, that means it can power a Streamlit app. 
+
+```{python}
+model_ref = model_registry.ModelReference(
+    registry=registry, 
+    model_name=model_name, 
+    model_version="V1"
+)
+
+
+restored_model = model_ref.load_model()
+
+restored_prediction = restored_model.predict(enriched_df.to_pandas())
+
+print(restored_prediction)
+```
+
+
