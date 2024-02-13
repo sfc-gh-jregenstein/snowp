@@ -1,0 +1,426 @@
+---
+title: "Forecasting with Snowpark Python"
+format: html
+---
+
+### Create Conda Env
+
+1. conda create --name nixtla --override-channels -c https://repo.anaconda.com/pkgs/snowflake python=3.11
+2. install libraries
+
+### Load Libraries for this Session
+
+
+```{python}
+from snowflake.snowpark.session import Session
+import snowflake.snowpark.types as T
+import snowflake.snowpark.functions as F
+from snowflake.snowpark.functions import  col, udf, udtf, lag, lit, trunc, to_date
+from snowflake.snowpark.types import IntegerType, FloatType, StringType, StructType, StructField
+ 
+import json
+import os
+import numpy as np
+import pandas as pd
+from datetime import date, timedelta
+
+import warnings
+warnings.filterwarnings("ignore")
+```
+
+### Enter Creds, Connect to Snowflake and Create Session
+
+```{python}
+
+# Read credentials
+with open('creds.json') as f:
+    connection_parameters = json.load(f)
+# Connect to a snowflake session
+session = Session.builder.configs(connection_parameters).create()
+```
+
+### Confirm DB, Schema and WH
+
+```{python}
+# check or confirm current session settings
+session.get_current_database()
+session.get_current_schema()
+session.get_current_warehouse()
+
+```
+
+### Univariate Forecast with SKtime
+
+```{python}
+
+revelio_data = (
+    session.table("REVELIO_SALES_AVG_SAL") \
+    .select("DATE", "COMPANY", "AVG_SALARY") \
+    .filter((col('DATE') < '2023-02-01')) 
+)
+
+
+df_data = (
+    revelio_data \
+    .to_pandas() \
+    .assign(DATE = lambda x: pd.to_datetime(x['DATE']))  \
+    .reset_index() \
+    .sort_values(by=['DATE']) \
+    .reset_index(drop=True)
+)
+
+df_data.head(5)
+```
+
+
+```{python}
+from sktime.forecasting.base import ForecastingHorizon
+from sktime.forecasting.arima import AutoARIMA
+```
+
+We can run this locally for testing or sandboxing.
+
+```{python}
+# specify training length and forecast
+train_length = 120
+forecast_horizon = 12
+
+train_end = max(df_data['DATE'])
+train_start = train_end - pd.Timedelta(days = 30 * train_length)
+df_data = df_data.sort_values(by=['DATE']).reset_index(drop=True)
+# filter data to the training period
+df_input = df_data.loc[(df_data['DATE'] >= train_start) &
+                        (df_data['DATE'] <= train_end)].reset_index(drop=True)
+
+# convert to a series
+df_input = pd.Series(df_input['AVG_SALARY'].values, index=df_input['DATE'])
+
+df_input.index = df_input.index.to_period('M')
+df_input = df_input.resample('M').asfreq() 
+
+```
+
+Next we establish a forecasting horizon object, specify our model, fit our model and run our forecast. 
+
+```{python}
+
+# establish forecasting horizon
+fh = ForecastingHorizon(np.arange(1, forecast_horizon + 1), is_relative=True)
+
+# specify our model
+forecaster = AutoARIMA(sp = 12, suppress_warnings = True)
+
+# fit our model
+forecaster.fit(df_input)
+
+# use our fit model to get a forecast
+y_pred = forecaster.predict(fh)
+```
+
+Here's a peek at our results, the forecasted values for core CPI twelve months ahead. 
+```{python}
+y_pred.to_frame().reset_index()
+```
+
+Once we're satisfied with this code flow, let's move it to the cloud and make it so we can iterate over all 3 of our time series. 
+
+Before we even create our UDTF, we need a data base where we can store that UDTF. We could create one just for this project but we already have one called 'BF_DEMOS' where we store all of our various time series work. Then within that data base, we create a new schema and stage to hold our UDTF function. 
+
+```{python}
+session.sql("CREATE SCHEMA IF NOT EXISTS BF_DEMOS.LSEG").collect()
+session.sql("CREATE STAGE IF NOT EXISTS BF_DEMOS.LSEG.ML_MODELS").collect()
+```
+
+
+We first specify a `schema` for the output of our UDTF. In this case, we want the following columns: date, forecast, train_start, train_end and forecast horizon. We also specify the `type` for each of these columns. 
+
+Next we create our UDTF with a call to `@F.udtf()`. This is where we specify our output schema, our input types, name our function, identify a location (the Models stage we just created), and list the packages we'll need. Next we define a `class` and a few settings that won't change in future posts when we create new UDTFs for different forecasting functions. 
+
+Finally we load our functions from `sktime` and then we use the *same* code that we ran locally above, except we don't filter to just one inflation series. We end with a call to `itertuples` so that we can loop over each of our inflation series. 
+
+
+```{python}
+
+# schema to specify our tabular output types and fields
+schema = T.StructType([
+    T.StructField("DATE", T.StringType()),
+    T.StructField("FORECAST", T.IntegerType()),
+    T.StructField("TRAIN_START", T.DateType()),
+    T.StructField("TRAIN_END", T.DateType()),
+    T.StructField("FORECAST_HORIZON", T.IntegerType())
+])
+
+@F.udtf(output_schema = schema,
+        input_types = [T.VariantType()],
+        name = "FORECAST_SKTIME", 
+        is_permanent=True, 
+        stage_location= "@BF_DEMOS.REVELIO.ML_MODELS",
+         session=session,
+        packages=['pandas', 'sktime', 'pmdarima'],
+        replace=True) 
+
+# boilerplate not to be changed usually
+class forecast:
+    def __init__(self):
+        self.rows=[]
+        self.dfs=[]
+    
+    def process(self, data):
+        self.rows.append(data)
+
+        # Merge rows into a dataframe
+        if len(self.rows) >= 16000:
+            df = pd.DataFrame(self.rows)
+            self.dfs.append(df)
+            self.rows = []
+        
+        # Merge dataframes into a single dataframe
+        # Minimizes memory footprint
+        if len(self.dfs) >= 100:
+            merged_df = pd.concat(self.dfs)
+            self.dfs = [merged_df]
+
+        yield None
+    
+    def end_partition(self):
+        # Load functions from packages
+        from sktime.forecasting.base import ForecastingHorizon
+        from sktime.forecasting.arima import AutoARIMA
+
+        # Boiler Plate Code for row merging
+        if len(self.rows) > 0:
+            df = pd.DataFrame(self.rows)
+            self.dfs.append(df)
+            self.rows = []
+        df_data = pd.concat(self.dfs)
+        
+        # Process Input
+        df_data['DATE'] = pd.to_datetime(df_data['DATE'])
+        df_data = df_data.groupby('DATE').sum('VALUE').reset_index()
+        df_data = df_data[['DATE','AVG_SALARY']]
+
+        #Train + Forecast Length
+        train_length = 120
+        forecast_horizon = 12
+        train_end = max(df_data['DATE'])
+        train_start = train_end - pd.Timedelta(days = 30*train_length)
+        
+        df_input = df_data.loc[(df_data['DATE'] >= train_start) &
+                                (df_data['DATE'] <= train_end)].reset_index(drop=True)
+        
+        df_input = pd.Series(df_input['AVG_SALARY'].values, index=df_input['DATE'])
+        df_input.index = df_input.index.to_period('M')
+        df_input = df_input.resample('M').asfreq()
+
+        
+        # Forecasting
+
+        fh = ForecastingHorizon(np.arange(1, forecast_horizon + 1), is_relative=True)
+
+        forecaster = AutoARIMA(sp = 12, suppress_warnings = True)
+
+        forecaster.fit(df_input)
+
+        y_pred = forecaster.predict(fh)
+
+        # Output Processing
+        df_forecast = y_pred.to_frame().reset_index()
+        df_forecast.columns = ['DATE','FORECAST']
+        
+        df_forecast['TRAIN_START'] = train_start
+        df_forecast['TRAIN_END'] = train_end
+        df_forecast['FORECAST_HORIZON'] = forecast_horizon
+
+        yield from df_forecast.itertuples(index=False, name=None)
+```
+
+Now that our UDTF is registered, we can pass our `df_data` object and get a forecast. Notice how we use this line `model(variant_column).over(partition_by=['COMPANY'])` to run the forecast on each of our time series. We have only a couple here, but this could just as easily be 10, 50 or 1000 time series. 
+
+```{python} 
+df = revelio_data.with_column('ROW', F.object_construct_keep_null('*')) \
+        .select(F.col('COMPANY'), F.col('ROW'))
+
+model = F.table_function("BF_DEMOS.REVELIO.FORECAST_SKTIME")
+
+variant_column = F.parse_json(df.col('ROW').cast(T.VariantType()))
+
+forecast = df.select(
+                F.col('COMPANY'), 
+                model(variant_column).over(partition_by=['COMPANY'])
+                )
+
+forecast.show()
+forecast.write.save_as_table("BF_DEMOS.REVELIO.SKTIME_FORECASTS", mode="overwrite")
+```
+
+
+We used the `sktime` package for this work, but we could use any of the packages in the Anaconda repo to run similar work and take advantage of the UDTF performance.
+
+
+
+
+### Forecasting Market Psych: A scaleable mlforecast workflow
+
+```{python}
+from mlforecast import MLForecast
+from sklearn.linear_model import LinearRegression
+from mlforecast.target_transforms import Differences
+from xgboost import XGBRegressor
+from sklearn.ensemble import RandomForestRegressor
+```
+
+
+
+```{python}
+session.use_schema("LSEG")
+```
+
+```{python}
+schema = T.StructType([
+    T.StructField("ID", T.StringType()),
+    T.StructField("TIMESTAMP", T.DateType()),
+    T.StructField("LINREG", T.FloatType()),
+    T.StructField("XGB", T.FloatType()),
+    T.StructField("RAN_FOREST", T.FloatType()),
+    T.StructField("TRAIN_START", T.DateType()),
+    T.StructField("TRAIN_END", T.DateType()),
+    T.StructField("FORECAST_HORIZON", T.IntegerType())
+                  ])
+
+@F.udtf(output_schema = schema,
+        input_types = [T.VariantType()],
+        name = "DAILY_MLFORECAST", 
+        is_permanent=True, 
+        stage_location= "@BF_DEMOS.LSEG.ML_MODELS", 
+        session=session,
+        packages=['pandas', 'mlforecast' ,'xgboost', 'scikit-learn'],
+        replace=True
+       )
+
+class forecast:
+    def __init__(self):
+        self.rows=[]
+        self.dfs=[]
+    
+    def process(self, data):
+        self.rows.append(data)
+
+        # Merge rows into a dataframe
+        if len(self.rows) >= 16000:
+            df = pd.DataFrame(self.rows)
+            self.dfs.append(df)
+            self.rows = []
+        
+        # Merge dataframes into a single dataframe
+        # Minimizes memory footprint
+        if len(self.dfs) >= 100:
+            merged_df = pd.concat(self.dfs)
+            self.dfs = [merged_df]
+
+        yield None
+    
+    def end_partition(self):
+        # Merge any remaining rows
+        from mlforecast import MLForecast
+        from mlforecast.target_transforms import Differences
+        from xgboost import XGBRegressor
+        from sklearn.linear_model import LinearRegression
+        from sklearn.ensemble import RandomForestRegressor
+
+        if len(self.rows) > 0:
+            df = pd.DataFrame(self.rows)
+            self.dfs.append(df)
+            self.rows = []
+
+        # Process Input
+        df_input = pd.concat(self.dfs)
+        df_input['DATE'] = pd.to_datetime(df_input['DATE'])
+        # df_input.reset_index()
+        df_input = df_input[['DATE', 'COMPANY', 'AVG_SENTIMENT']]
+        df_input.columns = ['ds', 'unique_id', 'y']
+
+        #Train + Forecast Length
+        train_length = 180
+        fh = 130 # Forecast Horizon
+        train_end = max(df_input['ds'])
+        train_start = min(df_input['ds'])
+        
+        df_input = df_input.loc[(df_input['ds'] >= train_start) &
+                                (df_input['ds'] < train_end)].reset_index(drop=True)
+
+        
+        fcst = MLForecast(models = [LinearRegression(), 
+                                    XGBRegressor(), 
+                                    RandomForestRegressor()],
+                          freq = 'D',
+                          lags = 30, 90 ,180],
+                          target_transforms = [Differences([30, 180])])
+        
+        fcst.fit(df_input.iloc[0:-fh])
+
+        ts_forecast = fcst.predict(fh)
+        
+        # Processing
+        ts_forecast.columns = ['ID','TIMESTAMP','LINREG','XGB', 'RAN_FOREST']
+        ts_forecast['TRAIN_START'] = train_start
+        ts_forecast['TRAIN_END'] = train_end
+        ts_forecast['FORECAST_HORIZON'] = fh
+
+        yield from ts_forecast.itertuples(index=False, name=None) 
+```
+
+
+```{python}
+
+df = session.table("mkt_psych_daily_avg") \
+    .select("DATE", "COMPANY", "AVG_SENTIMENT") \
+    .filter((col('DATE') < '2023-11-01')) \
+    .filter((col('DATE') > '2016-01-01')) \
+    .with_column('ROW', F.object_construct_keep_null('*')) \
+    .select(F.col('COMPANY'), F.col('ROW'))
+
+store_forecast_test = F.table_function("DAILY_MLFORECAST")
+
+variant_column = F.parse_json(df.col('ROW').cast(T.VariantType()))
+
+mktpsych_forecast = df.select(
+                store_forecast_test(variant_column).over(partition_by=['COMPANY'])
+                )
+
+mktpsych_forecast = mktpsych_forecast.with_column('FORECAST_DATETIME', F.current_timestamp())
+
+mktpsych_forecast.show(5)
+
+mktpsych_forecast.write.save_as_table("BF_DEMOS.LSEG.MKTPSYCH_FORECAST_USING_MLFORECAST", mode="overwrite")
+
+```
+
+```{python}
+
+df_mktpsych_forecast = (
+    mktpsych_forecast.select("TIMESTAMP", "ID", "XGB", "RAN_FOREST")\
+    .to_pandas() \
+    .assign(TIMESTAMP = lambda x: pd.to_datetime(x['TIMESTAMP']))\
+    .rename({'TIMESTAMP': 'DATE', 'ID': 'COMPANY', 'XGB': 'XGB_FORECAST', 'RAN_FOREST': 'RF_FORECAST'}, axis='columns')
+
+)
+
+df_mktpsych_forecast.tail()
+```
+
+```{python}
+df_mktpsych_actual = session.table("mkt_psych_daily_avg") \
+    .select("DATE", "COMPANY", "AVG_SENTIMENT") \
+    .to_pandas() \
+    .assign(DATE = lambda x: pd.to_datetime(x['DATE']))\
+    .rename({'AVG_SENTIMENT': 'ACTUAL'}, axis = 'columns')
+```
+
+
+```{python}
+df_mktpsych_act_fore = pd.merge(df_mktpsych_actual, df_mktpsych_forecast, on = ['DATE', 'COMPANY'], how = 'outer').reset_index().assign(DATE = lambda x: pd.to_datetime(x['DATE']).dt.date)
+
+df_mktpsych_act_fore.head(20)
+
+session.write_pandas(df_mktpsych_act_fore, "MKTPSYCH_ACTUAL_FORECAST", overwrite = "true")
+```
